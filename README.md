@@ -1,0 +1,1 @@
+A simple language parser made in Haskell to learn Monads.
