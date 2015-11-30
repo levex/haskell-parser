@@ -132,7 +132,6 @@ parseKeyword' (str, exp) = do
     []                          -> throwError EOFError
     _                           -> throwError NoParseError
 
-
 parseWord :: Parser Expr
 parseWord = do
   (loc, str) <- get
@@ -175,7 +174,7 @@ parseOp = do
       (c : cs) -> do
         if (c == '+') then do
           put (loc + 1, cs)
-          return $ OperatorExpr OpAdd 
+          return $ OperatorExpr OpAdd
         else if (c == '*') then do
           put (loc + 1, cs)
           return $ OperatorExpr OpMul
