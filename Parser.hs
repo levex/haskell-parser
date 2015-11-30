@@ -3,7 +3,7 @@ module Parser where
 
 import Control.Monad.State
 import Control.Monad.Except
-import Control.Monad.Trans.Writer
+import Control.Monad.Writer
 import Data.List
 
 -- TODO
@@ -26,6 +26,7 @@ data LType
 
 data LOp
     = OpAdd
+    | OpMul
     | EmptyOp
     deriving (Show)
 
@@ -56,6 +57,9 @@ keywords = [("True", LiteralExpr TypeBool "T"),
             ("Int", TypeExpr TypeInt),
             ("String", TypeExpr TypeString)]
 
+type LVariable = (LType, String)
+type VariableEnvironment = [(String, LVariable)]
+
 -- Tracks coloumn
 type Location = Int
 type ParserState = (
@@ -63,7 +67,7 @@ type ParserState = (
                     String     -- Data we have to parse
                    )
 
-type Parser a = ExceptT ParserError (WriterT String (State ParserState)) a
+type Parser a = ExceptT ParserError (WriterT [String] (State ParserState)) a
 
 mkParserState :: String -> ParserState
 mkParserState str = (0, str)
@@ -86,6 +90,18 @@ run f st
       Right s  -> show s
     where
       ((res, log), rem) = runMonadicParser f st
+
+skipWhitespace :: Parser Expr
+skipWhitespace = flip safe (return EmptyExpr) $ do
+  (loc, str) <- get
+  case str of
+    (c : cs) ->
+      if (c == ' ') then do
+        put (loc + 1, cs)
+        skipWhitespace
+      else
+        return EmptyExpr
+    _        -> return EmptyExpr
 
 -- Handles parsing error by returning a value when it hits EOF
 -- and passing through to the next call if it is a different error
@@ -116,17 +132,6 @@ parseKeyword' (str, exp) = do
     []                          -> throwError EOFError
     _                           -> throwError NoParseError
 
-skipWhitespace :: Parser Expr
-skipWhitespace = flip safe (return EmptyExpr) $ do
-  (loc, str) <- get
-  case str of
-    (c : cs) ->
-      if (c == ' ') then do
-        put (loc + 1, cs)
-        skipWhitespace
-      else
-        return EmptyExpr
-    _        -> return EmptyExpr
 
 parseWord :: Parser Expr
 parseWord = do
@@ -157,24 +162,28 @@ parseVariableDecl = do
     _          -> throwError $ OtherError "Variable name expected"
 
 -- Refactor?
+-- Implement variable declarations
 parseOp :: Parser Expr
 parseOp = do
   skipWhitespace
-  p1 <- parseWord `catchError` (\case {
+  p1 <- parseVal [] (parseWord `catchError` (\case {
           EOFError -> throwError $ OtherError "Argument expected"
-        })
+        }))
   skipWhitespace
   (loc, str) <- get
   (OperatorExpr op) <- case str of
       (c : cs) -> do
         if (c == '+') then do
           put (loc + 1, cs)
-          return $ OperatorExpr OpAdd
+          return $ OperatorExpr OpAdd 
+        else if (c == '*') then do
+          put (loc + 1, cs)
+          return $ OperatorExpr OpMul
         else throwError $ OtherError "Invalid operator"
       _        -> throwError EOFError
   skipWhitespace
-  p2 <- parseWord `catchError` (\_ ->
-        throwError $ OtherError "Partial application unsupported")
+  p2 <- parseVal [] (parseWord `catchError` (\_ ->
+        throwError $ OtherError "Partial application unsupported"))
   return (OperatorAppl p1 op p2)
 
 parseString :: Parser Expr
@@ -184,7 +193,7 @@ parseString = do
     (c : cs) ->
       if (c == '"' && isSuffixOf "\"" cs) then do
         put (loc + (length str), [])
-        return $ Val (init cs)
+        return $ LiteralExpr TypeString (init cs)
       else throwError InvalidStringError
     _       -> throwError EOFError
 
@@ -195,15 +204,25 @@ parseNumbers = do
     (c : cs) ->
       if (c >= '0' && c <= '9') then do
         put (loc + 1, cs)
-        (Val x) <- parseNumbers `catchError` (handleParseError parseNumbers (Val []))
-        return (Val (c : x))
+        (LiteralExpr TypeInt x) <- parseNumbers `catchError`
+            (handleParseError parseNumbers (LiteralExpr TypeInt []))
+        return (LiteralExpr TypeInt (c : x))
       else
         throwError NotANumberError
     _        -> throwError EOFError
 
-literalize :: Expr -> Expr
-literalize (Val x)
-  = LiteralExpr TypeInt s
-  where
-    (Val s) = runExpr parseNumbers x
-literalize _ = EmptyExpr
+-- Parses a (Val x) Expression into VariableExpr or LiteralExpr
+parseVal :: VariableEnvironment -> Parser Expr -> Parser Expr
+parseVal env expr = do
+  (Val e) <- expr
+  case (lookup e env) of
+    Nothing      -> do
+      init <- get
+      put $ mkParserState e
+      s@(LiteralExpr _ n) <- parseNumbers `catchError` (\err -> do
+          put $ mkParserState e
+          parseString `catchError` (\_ -> do
+            throwError $ OtherError "Invalid literal or variable not found"))
+      put init
+      return s
+    Just (t, v)  -> return $ LiteralExpr t v
