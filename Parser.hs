@@ -63,6 +63,7 @@ type VariableEnvironment = [(String, LVariable)]
 -- Tracks coloumn
 type Location = Int
 type ParserState = (
+                    VariableEnvironment, -- Variables parsed
                     Location,  -- Location tracking where we are
                     String     -- Data we have to parse
                    )
@@ -70,7 +71,7 @@ type ParserState = (
 type Parser a = ExceptT ParserError (WriterT [String] (State ParserState)) a
 
 mkParserState :: String -> ParserState
-mkParserState str = (0, str)
+mkParserState str = ([("ENV", (TypeInt, "1"))], 0, str)
 
 runMonadicParser f st
   = (runState . runWriterT . runExceptT) f (mkParserState st)
@@ -86,18 +87,18 @@ runExpr f st
 run :: Show a => Parser a -> String -> String
 run f st
   = case res of
-      Left err -> show err ++ " at column " ++ show (fst rem)
+      Left err -> show err ++ " at column " ++ show loc
       Right s  -> show s
     where
-      ((res, log), rem) = runMonadicParser f st
+      ((res, log), (_, loc, rem)) = runMonadicParser f st
 
 skipWhitespace :: Parser Expr
 skipWhitespace = flip safe (return EmptyExpr) $ do
-  (loc, str) <- get
+  (var, loc, str) <- get
   case str of
     (c : cs) ->
       if (c == ' ') then do
-        put (loc + 1, cs)
+        put (var, loc + 1, cs)
         skipWhitespace
       else
         return EmptyExpr
@@ -112,11 +113,17 @@ handleParseError f e x
 
 parseKeyword :: Parser Expr
 parseKeyword = do
-  (loc, str) <- get
+  (var, loc, str) <- get
   foldl1 (<|>) (map parseKeyword' keywords)
 
 (<|>) :: Parser a -> Parser a -> Parser a
 p1 <|> p2 = p1 `catchError` (\_ -> p2)
+
+parseLine :: Parser Expr
+parseLine = do
+  init <- get
+  parseVariableDecl `catchError` (\_ ->
+    parseOp `catchError` (\err -> throwError err))
 
 -- TODO
 -- (+++) :: Parser a -> Parser a -> Parser a
@@ -124,21 +131,21 @@ p1 <|> p2 = p1 `catchError` (\_ -> p2)
 
 parseKeyword' :: Keyword -> Parser Expr
 parseKeyword' (str, exp) = do
-  (loc, st) <- get
+  (var, loc, st) <- get
   case st of
     (stripPrefix str -> Just r) -> do
-        put (loc + length str, r)
+        put (var, loc + length str, r)
         return exp
     []                          -> throwError EOFError
     _                           -> throwError NoParseError
 
 parseWord :: Parser Expr
 parseWord = do
-  (loc, str) <- get
+  (var, loc, str) <- get
   case str of
     (c : cs) -> do
       let (w, r) = span (\x -> x /= ' ') str
-      put (loc + length w, r)
+      put (var, loc + length w, r)
       return $ Val w
     _        -> throwError EOFError
 
@@ -148,7 +155,7 @@ safe p k = do
 
 parseVariableDecl :: Parser Expr
 parseVariableDecl = do
-  (loc, str) <- get
+  (var, loc, str) <- get
   tpe <- safe parseKeyword (return EmptyExpr)
   (TypeExpr dtype) <- case tpe of
              (TypeExpr ty) -> do
@@ -165,44 +172,45 @@ parseVariableDecl = do
 parseOp :: Parser Expr
 parseOp = do
   skipWhitespace
-  p1 <- parseVal [] (parseWord `catchError` (\case {
+  (var, _, _) <- get
+  p1 <- parseVal var (parseWord `catchError` (\case {
           EOFError -> throwError $ OtherError "Argument expected"
         }))
   skipWhitespace
-  (loc, str) <- get
+  (_, loc, str) <- get
   (OperatorExpr op) <- case str of
       (c : cs) -> do
         if (c == '+') then do
-          put (loc + 1, cs)
+          put (var, loc + 1, cs)
           return $ OperatorExpr OpAdd
         else if (c == '*') then do
-          put (loc + 1, cs)
+          put (var, loc + 1, cs)
           return $ OperatorExpr OpMul
         else throwError $ OtherError "Invalid operator"
       _        -> throwError EOFError
   skipWhitespace
-  p2 <- parseVal [] (parseWord `catchError` (\_ ->
+  p2 <- parseVal var (parseWord `catchError` (\_ ->
         throwError $ OtherError "Partial application unsupported"))
   return (OperatorAppl p1 op p2)
 
 parseString :: Parser Expr
 parseString = do
-  (loc, str) <- get
+  (var, loc, str) <- get
   case str of
     (c : cs) ->
       if (c == '"' && isSuffixOf "\"" cs) then do
-        put (loc + (length str), [])
+        put (var, loc + (length str), [])
         return $ LiteralExpr TypeString (init cs)
       else throwError InvalidStringError
     _       -> throwError EOFError
 
 parseNumbers :: Parser Expr
 parseNumbers = do
-  (loc, str) <- get
+  (var, loc, str) <- get
   case str of
     (c : cs) ->
       if (c >= '0' && c <= '9') then do
-        put (loc + 1, cs)
+        put (var, loc + 1, cs)
         (LiteralExpr TypeInt x) <- parseNumbers `catchError`
             (handleParseError parseNumbers (LiteralExpr TypeInt []))
         return (LiteralExpr TypeInt (c : x))
@@ -224,4 +232,5 @@ parseVal env expr = do
             throwError $ OtherError "Invalid literal or variable not found"))
       put init
       return s
-    Just (t, v)  -> return $ LiteralExpr t v
+    Just (t, v)  -> do
+      return $ LiteralExpr t v
