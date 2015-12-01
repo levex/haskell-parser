@@ -5,6 +5,7 @@ import Control.Monad.State
 import Control.Monad.Except
 import Control.Monad.Writer
 import Data.List
+import Data.List.Split
 
 -- TODO
 -- * Control.Applicative.Alternative  ?
@@ -16,6 +17,8 @@ data ParserError
     | InvalidBooleanError
     | InvalidStringError
     | NoParseError
+    | VariableExistsError
+    | UnassignedVariableError
     | OtherError String
 
 data LType
@@ -37,7 +40,7 @@ data Expr
     | OperatorExpr LOp
     | OperatorAppl Expr LOp Expr
     | EmptyExpr
-    | VariableDecl LType String
+    | VariableDecl LType String Expr
     deriving (Show)
 
 instance Show ParserError where
@@ -46,6 +49,8 @@ instance Show ParserError where
   show InvalidBooleanError = "Invalid boolean"
   show InvalidStringError = "Invalid string"
   show NoParseError = "Parse error"
+  show VariableExistsError = "Variable already exists"
+  show UnassignedVariableError = "Variable was not assigned a value"
   show (OtherError str) = str -- blurp, unsafe
 
 -- Maps keywords to Expressions
@@ -70,8 +75,11 @@ type ParserState = (
 
 type Parser a = ExceptT ParserError (WriterT [String] (State ParserState)) a
 
+reserved = "+*="
+whitespace = " "
+
 mkParserState :: String -> ParserState
-mkParserState str = ([("ENV", (TypeInt, "1"))], 0, str)
+mkParserState str = ([("ENV", (TypeInt, "1337"))], 0, str)
 
 runMonadicParser f st
   = (runState . runWriterT . runExceptT) f (mkParserState st)
@@ -122,8 +130,21 @@ p1 <|> p2 = p1 `catchError` (\_ -> p2)
 parseLine :: Parser Expr
 parseLine = do
   init <- get
-  parseVariableDecl `catchError` (\_ ->
-    parseOp `catchError` (\err -> throwError err))
+  parseVariableDecl `catchError` (\err -> do
+    case err of
+      (NoParseError) -> parseOp `catchError` (\err -> throwError err)
+      _              -> throwError err)
+
+parseLines :: Parser Expr
+parseLines = do
+  (var, _, str) <- get
+  let lines = splitOneOf "\n;" str
+  exp <- forM lines (\e -> do
+        (ivar, iloc, _) <- get
+        put (ivar, iloc, e)
+        expr <- parseLine
+        return expr)
+  return (exp !! (length exp - 1))
 
 -- TODO
 -- (+++) :: Parser a -> Parser a -> Parser a
@@ -144,10 +165,12 @@ parseWord = do
   (var, loc, str) <- get
   case str of
     (c : cs) -> do
-      let (w, r) = span (\x -> x /= ' ') str
+      let (w, r) = span (\x -> not $ elem x sep) str
       put (var, loc + length w, r)
       return $ Val w
     _        -> throwError EOFError
+  where
+    sep = whitespace ++ reserved
 
 safe :: Parser a -> Parser a -> Parser a
 safe p k = do
@@ -155,17 +178,35 @@ safe p k = do
 
 parseVariableDecl :: Parser Expr
 parseVariableDecl = do
-  (var, loc, str) <- get
   tpe <- safe parseKeyword (return EmptyExpr)
   (TypeExpr dtype) <- case tpe of
              (TypeExpr ty) -> do
                return (TypeExpr ty)
-             _             -> throwError $ OtherError "Type expected"
+             _             -> throwError NoParseError
   skipWhitespace
   (Val name) <- parseWord
-  case name of
-    (_: _)     -> return (VariableDecl dtype name)
-    _          -> throwError $ OtherError "Variable name expected"
+  (var, _, _) <- get
+  case lookup name var of
+    Just _  -> throwError VariableExistsError
+    Nothing -> do
+      skipWhitespace
+      tell ["Variable was not found"]
+      (var, loc, str) <- get
+      case str of
+        (c : cs) -> do
+          if (c == '=') then do
+            put (var, loc + 1, cs)
+            skipWhitespace
+            r <- parseVal var parseWord
+            v@(LiteralExpr _ val) <- case r of
+                  k@(LiteralExpr dtype val) -> return k
+                  _                         -> throwError $ OtherError "type mismatch"
+            (_, l, s) <- get
+            put ((name, (dtype, val)) : var, l, s)
+            return $ VariableDecl dtype name v
+          else throwError UnassignedVariableError
+        _       -> do
+          throwError UnassignedVariableError
 
 -- Refactor?
 -- Implement variable declarations
@@ -222,6 +263,7 @@ parseNumbers = do
 parseVal :: VariableEnvironment -> Parser Expr -> Parser Expr
 parseVal env expr = do
   (Val e) <- expr
+  tell ["parseVal: ", e]
   case (lookup e env) of
     Nothing      -> do
       init <- get
